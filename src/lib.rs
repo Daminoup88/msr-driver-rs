@@ -6,19 +6,31 @@ compile_error!("msr-driver-rs supports Windows only");
 #[cfg(all(feature = "scaphandre", feature = "winring0"))]
 compile_error!("Cannot enable both 'scaphandre' and 'winring0' features at the same time");
 
-#[cfg(not(any(feature = "scaphandre", feature = "winring0")))]
-compile_error!("At least one of 'scaphandre' or 'winring0' features must be enabled");
+#[cfg(all(feature = "scaphandre", feature = "pawnio"))]
+compile_error!("Cannot enable both 'scaphandre' and 'pawnio' features at the same time");
+
+#[cfg(all(feature = "winring0", feature = "pawnio"))]
+compile_error!("Cannot enable both 'winring0' and 'pawnio' features at the same time");
+
+#[cfg(not(any(feature = "scaphandre", feature = "winring0", feature = "pawnio")))]
+compile_error!("Exactly one of 'scaphandre', 'winring0', or 'pawnio' features must be enabled");
 
 mod device;
 mod error;
+#[cfg(feature = "pawnio")]
+mod pawnio;
 mod service;
 mod util;
+#[cfg(feature = "pawnio")]
+pub mod vendor;
 
 pub use crate::error::{Error, Result};
+#[cfg(feature = "pawnio")]
+pub use crate::vendor::CpuVendor;
 
 /// Handle to the Windows MSR driver device.
 ///
-/// By default, this uses the Scaphandre driver. Enable the `winring0` feature to use WinRing0 instead (mutually exclusive).
+/// Mutually exclusive features: `pawnio` (default), `scaphandre`, or `winring0`.
 pub struct MsrDriver {
     device: device::DeviceHandle,
 }
@@ -79,4 +91,11 @@ impl MsrDriver {
     pub fn read_msr(&self, msr_register: u32, cpu_index: u32) -> Result<u64> {
         self.device.read_msr(msr_register, cpu_index)
     }
+}
+
+/// Cleans up legacy WinRing0 service and driver files created by msr-driver-rs.
+///
+/// Only removes the service and files if the service binary path matches `%TEMP%\msr-driver-rs\WinRing0x64.sys`. If WinRing0 was installed by another tool, it is left untouched.
+pub fn legacy_winring0_cleanup() -> Result<()> {
+    service::legacy_winring0_cleanup()
 }

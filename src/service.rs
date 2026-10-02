@@ -8,16 +8,19 @@ use std::{
 
 use windows_sys::Win32::{
     Foundation::{
-        ERROR_ALREADY_EXISTS, ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_EXISTS,
-        GetLastError,
+        ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_DOES_NOT_EXIST,
+        ERROR_SERVICE_EXISTS, GetLastError,
     },
     System::Services::{
-        ChangeServiceConfigW, CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW,
-        OpenServiceW, SC_HANDLE, SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
-        SERVICE_CONTROL_STOP, SERVICE_ERROR_NORMAL, SERVICE_KERNEL_DRIVER, SERVICE_NO_CHANGE, SERVICE_QUERY_STATUS,
-        SERVICE_START, SERVICE_STATUS, StartServiceW,
+        CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW,
+        QUERY_SERVICE_CONFIGW, QueryServiceConfigW, SC_HANDLE, SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT,
+        SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CONTROL_STOP, SERVICE_ERROR_NORMAL, SERVICE_KERNEL_DRIVER,
+        SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_START, SERVICE_STATUS, StartServiceW,
     },
 };
+
+#[cfg(not(feature = "pawnio"))]
+use windows_sys::Win32::System::Services::{ChangeServiceConfigW, SERVICE_NO_CHANGE};
 
 use crate::{
     error::{Error, Result, last_error},
@@ -25,18 +28,25 @@ use crate::{
 };
 
 #[cfg(feature = "scaphandre")]
-const DRIVER_BYTES: &[u8] = include_bytes!("../ScaphandreDrv.sys");
+const DRIVER_BYTES: &[u8] = include_bytes!("../drivers/scaphandre/ScaphandreDrv.sys");
 #[cfg(feature = "scaphandre")]
 const SERVICE_NAME: &str = "ScaphandreDrv";
 #[cfg(feature = "scaphandre")]
 const SERVICE_DISPLAY_NAME: &str = "Scaphandre Driver Service";
 
 #[cfg(feature = "winring0")]
-const DRIVER_BYTES: &[u8] = include_bytes!("../WinRing0x64.sys");
+const DRIVER_BYTES: &[u8] = include_bytes!("../drivers/winring0/WinRing0x64.sys");
 #[cfg(feature = "winring0")]
 const SERVICE_NAME: &str = "WinRing0_1_2_0";
 #[cfg(feature = "winring0")]
 const SERVICE_DISPLAY_NAME: &str = "Rust WinRing0 Driver Service";
+
+#[cfg(feature = "pawnio")]
+const DRIVER_BYTES: &[u8] = include_bytes!("../drivers/pawnio/PawnIO.sys");
+#[cfg(feature = "pawnio")]
+const SERVICE_NAME: &str = "PawnIO";
+#[cfg(feature = "pawnio")]
+const SERVICE_DISPLAY_NAME: &str = "PawnIO Kernel Driver";
 
 pub(crate) fn is_installed() -> Result<bool> {
     let manager = open_service_manager(SC_MANAGER_CONNECT)?;
@@ -67,6 +77,13 @@ pub(crate) fn is_installed() -> Result<bool> {
 /// Returns whether the deployed driver binary differs from the one embedded
 /// in this crate build. Returns `false` if nothing is deployed yet.
 pub(crate) fn needs_update() -> Result<bool> {
+    #[cfg(feature = "pawnio")]
+    {
+        if !is_owned_by_us() {
+            return Ok(false);
+        }
+    }
+
     match fs::read(driver_binary_path()) {
         Ok(existing) => Ok(hash_bytes(&existing) != hash_bytes(DRIVER_BYTES)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -123,6 +140,13 @@ pub(crate) fn start() -> Result<()> {
 }
 
 pub(crate) fn install() -> Result<()> {
+    #[cfg(feature = "pawnio")]
+    {
+        if is_installed()? {
+            return start();
+        }
+    }
+
     let outdated = needs_update()?;
     if outdated {
         stop_service();
@@ -161,28 +185,36 @@ pub(crate) fn install() -> Result<()> {
                 unsafe { CloseServiceHandle(manager) };
                 return Err(last_error("OpenServiceW"));
             }
-            // Update the service configuration to auto-start if already exists
-            let changed = unsafe {
-                ChangeServiceConfigW(
-                    existing,
-                    SERVICE_NO_CHANGE,
-                    SERVICE_AUTO_START,
-                    SERVICE_NO_CHANGE,
-                    driver_path_w.as_ptr(),
-                    null(),
-                    null_mut(),
-                    null(),
-                    null(),
-                    null(),
-                    null(),
-                )
-            };
-            if changed == 0 {
-                let code = unsafe { GetLastError() };
-                return Err(Error::WinApi {
-                    context: "ChangeServiceConfigW",
-                    code,
-                });
+
+            #[cfg(feature = "pawnio")]
+            {
+                mark_owned_by_us();
+            }
+
+            #[cfg(not(feature = "pawnio"))]
+            {
+                let changed = unsafe {
+                    ChangeServiceConfigW(
+                        existing,
+                        SERVICE_NO_CHANGE,
+                        SERVICE_AUTO_START,
+                        SERVICE_NO_CHANGE,
+                        driver_path_w.as_ptr(),
+                        null(),
+                        null_mut(),
+                        null(),
+                        null(),
+                        null(),
+                        null(),
+                    )
+                };
+                if changed == 0 {
+                    let code = unsafe { GetLastError() };
+                    return Err(Error::WinApi {
+                        context: "ChangeServiceConfigW",
+                        code,
+                    });
+                }
             }
 
             existing
@@ -194,6 +226,10 @@ pub(crate) fn install() -> Result<()> {
             });
         }
     } else {
+        #[cfg(feature = "pawnio")]
+        {
+            mark_owned_by_us();
+        }
         service
     };
 
@@ -227,6 +263,13 @@ fn stop_service() {
 }
 
 pub(crate) fn uninstall() -> Result<()> {
+    #[cfg(feature = "pawnio")]
+    {
+        if !is_owned_by_us() {
+            return Ok(());
+        }
+    }
+
     let manager = open_service_manager(SC_MANAGER_ALL_ACCESS)?;
     let service_name_w = to_utf16_z(SERVICE_NAME);
     let service = unsafe { OpenServiceW(manager, service_name_w.as_ptr(), SERVICE_ALL_ACCESS) };
@@ -236,6 +279,8 @@ pub(crate) fn uninstall() -> Result<()> {
         unsafe { CloseServiceHandle(manager) };
         if code == ERROR_SERVICE_DOES_NOT_EXIST {
             remove_driver_binary();
+            #[cfg(feature = "pawnio")]
+            clear_ownership();
             return Ok(());
         }
         return Err(Error::WinApi {
@@ -275,6 +320,8 @@ pub(crate) fn uninstall() -> Result<()> {
     }
 
     remove_driver_binary();
+    #[cfg(feature = "pawnio")]
+    clear_ownership();
 
     Ok(())
 }
@@ -306,16 +353,168 @@ fn remove_driver_binary() {
 }
 
 fn driver_binary_path() -> PathBuf {
-    let mut path = std::env::temp_dir();
-    #[cfg(feature = "scaphandre")]
+    #[cfg(feature = "pawnio")]
     {
+        let base = std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        let mut path = base;
         path.push("msr-driver-rs");
-        path.push("ScaphandreDrv.sys");
+        path.push("PawnIO.sys");
+        path
     }
-    #[cfg(feature = "winring0")]
+
+    #[cfg(not(feature = "pawnio"))]
     {
-        path.push("msr-driver-rs");
-        path.push("WinRing0x64.sys");
+        let mut path = std::env::temp_dir();
+        #[cfg(feature = "scaphandre")]
+        {
+            path.push("msr-driver-rs");
+            path.push("ScaphandreDrv.sys");
+        }
+        #[cfg(feature = "winring0")]
+        {
+            path.push("msr-driver-rs");
+            path.push("WinRing0x64.sys");
+        }
+        path
     }
+}
+
+#[cfg(feature = "pawnio")]
+fn ownership_marker_path() -> PathBuf {
+    let mut path = driver_binary_path();
+    path.set_extension("installed_by_msr_driver_rs");
     path
+}
+
+#[cfg(feature = "pawnio")]
+fn mark_owned_by_us() {
+    let path = ownership_marker_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, b"msr-driver-rs");
+}
+
+#[cfg(feature = "pawnio")]
+fn clear_ownership() {
+    let path = ownership_marker_path();
+    let _ = fs::remove_file(path);
+}
+
+#[cfg(feature = "pawnio")]
+fn is_owned_by_us() -> bool {
+    ownership_marker_path().exists()
+}
+
+fn query_service_binary_path(service_name: &str) -> Result<Option<String>> {
+    let manager = open_service_manager(SC_MANAGER_CONNECT)?;
+    let service_name_w = to_utf16_z(service_name);
+    let service = unsafe { OpenServiceW(manager, service_name_w.as_ptr(), SERVICE_QUERY_CONFIG) };
+
+    if service.is_null() {
+        let code = unsafe { GetLastError() };
+        unsafe { CloseServiceHandle(manager) };
+        if code == ERROR_SERVICE_DOES_NOT_EXIST {
+            return Ok(None);
+        }
+        return Err(Error::WinApi {
+            context: "OpenServiceW",
+            code,
+        });
+    }
+
+    let mut bytes_needed = 0u32;
+    unsafe {
+        QueryServiceConfigW(service, null_mut(), 0, &mut bytes_needed);
+    }
+    let code = unsafe { GetLastError() };
+    if code != ERROR_INSUFFICIENT_BUFFER {
+        unsafe {
+            CloseServiceHandle(service);
+            CloseServiceHandle(manager);
+        }
+        return Err(Error::WinApi {
+            context: "QueryServiceConfigW",
+            code,
+        });
+    }
+
+    let mut buffer = vec![0u8; bytes_needed as usize];
+    let ok = unsafe {
+        QueryServiceConfigW(
+            service,
+            buffer.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW,
+            bytes_needed,
+            &mut bytes_needed,
+        )
+    };
+
+    if ok == 0 {
+        let code = unsafe { GetLastError() };
+        unsafe {
+            CloseServiceHandle(service);
+            CloseServiceHandle(manager);
+        }
+        return Err(Error::WinApi {
+            context: "QueryServiceConfigW",
+            code,
+        });
+    }
+
+    let config = unsafe { &*(buffer.as_ptr() as *const QUERY_SERVICE_CONFIGW) };
+    let path_ptr = config.lpBinaryPathName;
+    let mut len = 0;
+    while unsafe { *path_ptr.add(len) } != 0 {
+        len += 1;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(path_ptr, len) };
+    let binary_path = String::from_utf16_lossy(slice);
+
+    unsafe {
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+    }
+
+    Ok(Some(binary_path))
+}
+
+pub fn legacy_winring0_cleanup() -> Result<()> {
+    let mut our_expected_path = std::env::temp_dir();
+    our_expected_path.push("msr-driver-rs");
+    our_expected_path.push("WinRing0x64.sys");
+
+    let service_name = "WinRing0_1_2_0";
+
+    if let Some(binary_path) = query_service_binary_path(service_name)? {
+        let normalized_binary = binary_path.trim_matches('"').trim_start_matches(r"\??\").to_lowercase();
+        let our_str = our_expected_path.to_string_lossy().to_lowercase();
+
+        if normalized_binary == our_str {
+            let manager = open_service_manager(SC_MANAGER_ALL_ACCESS)?;
+            let service_name_w = to_utf16_z(service_name);
+            let service = unsafe { OpenServiceW(manager, service_name_w.as_ptr(), SERVICE_ALL_ACCESS) };
+
+            if !service.is_null() {
+                let mut status = SERVICE_STATUS {
+                    dwServiceType: 0,
+                    dwCurrentState: 0,
+                    dwControlsAccepted: 0,
+                    dwWin32ExitCode: 0,
+                    dwServiceSpecificExitCode: 0,
+                    dwCheckPoint: 0,
+                    dwWaitHint: 0,
+                };
+                let _ = unsafe { ControlService(service, SERVICE_CONTROL_STOP, &mut status) };
+                let _ = unsafe { DeleteService(service) };
+                unsafe { CloseServiceHandle(service) };
+            }
+            unsafe { CloseServiceHandle(manager) };
+
+            let _ = fs::remove_file(&our_expected_path);
+        }
+    }
+
+    Ok(())
 }
